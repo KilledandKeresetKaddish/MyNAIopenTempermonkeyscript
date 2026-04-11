@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NAI maleLab - Danbooru Tag Lookup
 // @namespace    nai-malelab-danbooru
-// @version      1.2
+// @version      1.3
 // @description  在 Danbooru 页面上检查 artist / copyright / character tag 是否存在于 NAI maleLab 数据库
 // @match        https://danbooru.donmai.us/*
 // @grant        GM_xmlhttpRequest
@@ -9,6 +9,7 @@
 // @grant        GM_setValue
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
+// @grant        GM_setClipboard
 // @connect      *
 // ==/UserScript==
 
@@ -23,8 +24,9 @@
   const API_URL = `${BASE_URL}/api/danbooru-artist-lookup`;
 
   // 是否检查 copyright / character tag（artist 永远检查）
-  // 通过 Tampermonkey 菜单命令切换，持久化在 GM storage
-  let CHECK_EXTRA = GM_getValue('nml_check_extra', true);
+  // 通过 Tampermonkey 菜单命令分别切换，持久化在 GM storage
+  let CHECK_COPYRIGHT = GM_getValue('nml_check_copyright', true);
+  let CHECK_CHARACTER = GM_getValue('nml_check_character', true);
 
   // Danbooru 的 tag-type 约定：1=artist, 3=copyright, 4=character
   const TAG_TYPE_MAP = {
@@ -184,9 +186,8 @@
   // 根据当前开关状态返回所有需要检查的 tag 链接
   function findLookupTags() {
     const types = [1]; // artist 永远检查
-    if (CHECK_EXTRA) {
-      types.push(3, 4); // copyright, character
-    }
+    if (CHECK_COPYRIGHT) types.push(3);
+    if (CHECK_CHARACTER) types.push(4);
     const selectors = [];
     types.forEach((t) => {
       selectors.push(`.tag-type-${t} a.search-tag`);
@@ -195,8 +196,40 @@
     return document.querySelectorAll(selectors.join(', '));
   }
 
+  // 把 [name](url) 写入剪贴板，并在 badge 上给出临时视觉反馈
+  function copySubjectLink(badge, displayName, sourceUrl) {
+    const payload = `[${displayName}](${sourceUrl})`;
+    try {
+      if (typeof GM_setClipboard === 'function') {
+        GM_setClipboard(payload, 'text');
+      } else if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(payload);
+      } else {
+        // 最后兜底：临时 textarea
+        const ta = document.createElement('textarea');
+        ta.value = payload;
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        ta.remove();
+      }
+      console.log('[NML] copied to clipboard:', payload);
+      const original = badge.textContent;
+      const originalBg = badge.style.background;
+      badge.textContent = '已复制';
+      badge.style.background = '#1565c0';
+      setTimeout(() => {
+        badge.textContent = original;
+        badge.style.background = originalBg;
+      }, 1200);
+    } catch (err) {
+      console.error('[NML] clipboard copy failed:', err);
+    }
+  }
+
   async function processTag(linkEl) {
-    const tagName = linkEl.textContent.trim().replace(/ /g, '_');
+    const displayName = linkEl.textContent.trim();
+    const tagName = displayName.replace(/ /g, '_');
     if (!tagName || linkEl.dataset.nmlProcessed) return;
     linkEl.dataset.nmlProcessed = '1';
 
@@ -225,6 +258,14 @@
       } else {
         badge.className = `nml-lookup-badge not-found kind-${kind}`;
         badge.textContent = '✗';
+        badge.title = '点击复制 [name](url) 到剪贴板，用于提交新 subject';
+        // 取 Danbooru 链接（绝对 URL），用作 source_url
+        const sourceUrl = linkEl.href || '';
+        badge.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          copySubjectLink(badge, displayName, sourceUrl);
+        });
       }
 
       // hover tooltip
@@ -248,23 +289,33 @@
     }
   }
 
-  // Tampermonkey 菜单命令：切换是否检查 copyright/角色 tag
+  // Tampermonkey 菜单命令：分别切换是否检查 copyright / character tag
   if (typeof GM_registerMenuCommand === 'function') {
-    const label = CHECK_EXTRA
-      ? '✓ 检查 copyright/角色 tag（点击关闭）'
-      : '✗ 检查 copyright/角色 tag（点击开启）';
-    GM_registerMenuCommand(label, () => {
-      CHECK_EXTRA = !CHECK_EXTRA;
-      GM_setValue('nml_check_extra', CHECK_EXTRA);
-      // 刷新页面以重新扫描 tag（最简单可靠的方式）
-      location.reload();
-    });
+    GM_registerMenuCommand(
+      (CHECK_COPYRIGHT ? '✓' : '✗') + ' 检查 copyright tag（点击切换）',
+      () => {
+        CHECK_COPYRIGHT = !CHECK_COPYRIGHT;
+        GM_setValue('nml_check_copyright', CHECK_COPYRIGHT);
+        location.reload();
+      },
+    );
+    GM_registerMenuCommand(
+      (CHECK_CHARACTER ? '✓' : '✗') + ' 检查 character tag（点击切换）',
+      () => {
+        CHECK_CHARACTER = !CHECK_CHARACTER;
+        GM_setValue('nml_check_character', CHECK_CHARACTER);
+        location.reload();
+      },
+    );
   }
 
   // 启动
   function init() {
     const tagLinks = findLookupTags();
-    console.log('[NML] found', tagLinks.length, 'lookup tags on page (extra:', CHECK_EXTRA, ')');
+    console.log(
+      '[NML] found', tagLinks.length, 'lookup tags on page',
+      '(copyright:', CHECK_COPYRIGHT, ', character:', CHECK_CHARACTER, ')',
+    );
     tagLinks.forEach((el) => processTag(el));
   }
 
