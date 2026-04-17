@@ -4,6 +4,7 @@
 // @version      1.1
 // @description  在 Danbooru 页面上检查 artist tag 是否存在于 NAI maleLab 数据库
 // @match        https://danbooru.donmai.us/*
+// @author       Adonais
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @connect      *
