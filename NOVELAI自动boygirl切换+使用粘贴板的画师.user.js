@@ -3,6 +3,7 @@
 // @namespace    https://example.local/
 // @version      0.1.0
 // @description  从剪贴板读取 subject，自动生成 1girl 和 1boy 两张
+// @author       Adonais
 // @match        https://novelai.net/image*
 // @grant        GM_addStyle
 // ==/UserScript==
