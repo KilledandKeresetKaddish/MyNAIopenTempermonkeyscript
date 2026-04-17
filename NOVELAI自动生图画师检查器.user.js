@@ -3,6 +3,7 @@
 // @namespace    https://example.local/
 // @version      3.1.0
 // @description  从剪贴板读取 subject，按模板 / sex / tags / Quick Runs 自动生成 NovelAI 图片（无脚本内确认弹窗）
+// @author       Adonais
 // @match        https://novelai.net/image*
 // @grant        GM_addStyle
 // @grant        GM_getValue
