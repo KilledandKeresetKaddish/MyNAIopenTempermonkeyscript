@@ -3,6 +3,7 @@
 // @namespace    nai-malelab-danbooru
 // @version      1.3
 // @description  在 Danbooru 页面上检查 artist / copyright / character tag 是否存在于 NAI maleLab 数据库
+// @author       Adonais
 // @match        https://danbooru.donmai.us/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
