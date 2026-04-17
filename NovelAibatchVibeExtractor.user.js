@@ -3,6 +3,7 @@
 // @namespace    local.nai.vibe.batch.commitstrict
 // @version      1.0.13
 // @description  Strict per-card vibe extraction/downloading with commit verification for long virtualized lists
+// @author       Adonais
 // @match        https://novelai.net/*
 // @grant        none
 // @run-at       document-idle
