@@ -2,8 +2,8 @@
 // @name         Niji Journey 批量/逐组导出
 // @name:zh-CN   Niji Journey 批量/逐组导出
 // @namespace    https://nijijourney.com/
-// @version      6.0.0
-// @description  Niji/Midjourney 图片批量导出工具 | 选择模式批量导出 | 2x2 网格合成 | WebP/PNG 格式 | 质量/缩放可调 | 自动获取 Seed (API) | 完整 prompt + 参数提取 (React fiber) | mem-portable-metadata-v1 XMP 元数据 | PNG tEXt 元数据 | NJEX 蓝通道签名 | CreatorTool 识别标记
+// @version      6.1.0
+// @description  Niji/Midjourney 图片批量导出工具 | 选择模式批量导出 | 2x2 网格合成 | Lightbox 原图+Seed 下载 | WebP/PNG 格式 | 质量/缩放可调 | 自动获取 Seed (API) | 完整 prompt + 参数提取 (React fiber) | mem-portable-metadata-v1 XMP 元数据 | PNG tEXt 元数据 | NJEX 蓝通道签名 | CreatorTool 识别标记
 // @author       adonais & Claude
 // @match        https://nijijourney.com/*
 // @match        https://www.nijijourney.com/*
@@ -20,7 +20,7 @@
 
 /*
  * ╔═══════════════════════════════════════════════════════════════════╗
- * ║  Niji Journey 批量/逐组导出  v6.0.0                              ║
+ * ║  Niji Journey 批量/逐组导出  v6.1.0                              ║
  * ╠═══════════════════════════════════════════════════════════════════╣
  * ║                                                                   ║
  * ║  ■ 数据获取                                                       ║
@@ -55,6 +55,8 @@
  * ║    · 选择模式: ☐/☑ 多选 → 批量导出已选                            ║
  * ║    · 全选可见 / 取消全选                                           ║
  * ║    · 已导出记录 (localStorage): 跳过/标记已导出的 job              ║
+ * ║    · Lightbox 增强下载: 详情页官方下载按钮旁增加 [↓+S] 按钮       ║
+ * ║      下载 CDN 原始 PNG (零质量损失) + 注入 seed 和完整元数据       ║
  * ║                                                                   ║
  * ║  ■ 来源识别 (供外部工具检测)                                       ║
  * ║    · XMP CreatorTool == "NijiExport"  (WebP/PNG 均可靠)           ║
@@ -512,9 +514,156 @@
     updateAllCheckboxes(); fire();
   }
 
+  // ============================== LIGHTBOX ENHANCED DOWNLOAD ==============================
+  // 在 niji 的 lightbox (单图详情) 里,官方下载按钮旁加一个 "💾+seed" 按钮
+  // 下载 CDN 原始 PNG → 注入 metadata (含 seed) → 保存
+
+  function scanLightbox() {
+    // 已经注入过就跳过
+    if (document.querySelector('.nj-lb-btn')) return;
+
+    // 找官方下载按钮: title="Download Image"
+    const dlBtn = document.querySelector('button[title="Download Image"]');
+    if (!dlBtn) return;
+
+    // 从 URL 或图片 src 提取 jobId 和 index
+    let jobId = null, imgIndex = null;
+
+    // URL: /jobs/5f663a05-...?index=2
+    const urlMatch = location.pathname.match(/\/jobs\/([a-f0-9-]{36})/i);
+    if (urlMatch) jobId = urlMatch[1];
+    const idxMatch = location.search.match(/index=(\d+)/);
+    if (idxMatch) imgIndex = parseInt(idxMatch[1]);
+
+    // fallback: 从 lightbox 里的大图 src 提取
+    if (!jobId) {
+      const lbImg = document.querySelector('.cursor-zoom-in img[src*="cdn.midjourney.com"], .cursor-zoom-out img[src*="cdn.midjourney.com"]');
+      if (lbImg) {
+        const src = lbImg.src || '';
+        const m = src.match(/cdn\.midjourney\.com\/([a-f0-9-]{36})\/0_(\d+)/i);
+        if (m) { jobId = m[1]; if (imgIndex == null) imgIndex = parseInt(m[2]); }
+      }
+    }
+
+    if (!jobId) return;
+    if (imgIndex == null) imgIndex = 0;
+
+    // 创建按钮
+    const btn = document.createElement('button');
+    btn.className = 'nj-lb-btn';
+    btn.title = '下载原图 + Seed 元数据 (NijiExport)';
+    btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" height="18" class="shrink-0"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg><span class="nj-lb-badge">+S</span>`;
+
+    btn.addEventListener('click', async (e) => {
+      e.preventDefault(); e.stopPropagation();
+      await lightboxDownload(btn, jobId, imgIndex);
+    });
+
+    // 插入到官方下载按钮旁边
+    dlBtn.parentElement.insertBefore(btn, dlBtn.nextSibling);
+    log(`lightbox 按钮已注入: ${jobId.slice(0, 8)} index=${imgIndex}`);
+  }
+
+  async function lightboxDownload(btn, jobId, imgIndex) {
+    if (btn.dataset.busy) return;
+    btn.dataset.busy = '1';
+    const origHtml = btn.innerHTML;
+    btn.innerHTML = '⏳';
+
+    try {
+      // 1. 下载原始 PNG
+      const pngUrl = `${CDN}/${jobId}/0_${imgIndex}.png`;
+      log(`下载原图: ${pngUrl}`);
+      const pngBlob = await gmBlob(pngUrl);
+
+      // 2. 获取 seed
+      let seed = null;
+      try {
+        const r = await oF(`/api/get-seed?id=${encodeURIComponent(jobId)}`, {
+          method: 'GET', credentials: 'include',
+          headers: { 'Content-Type': 'application/json', 'X-CSRF-Protection': '1' }
+        });
+        if (r.ok) {
+          const d = await r.json();
+          const sv = d?.seed ?? d;
+          if (typeof sv === 'number' && sv > 0) seed = sv;
+          else if (typeof sv === 'string' && /^\d+$/.test(sv)) seed = parseInt(sv);
+        }
+      } catch {}
+
+      // 3. 获取 prompt + params (从缓存或 React fiber)
+      let prompt = '', finalParams = {};
+      const cached = jobCache.get(jobId);
+      if (cached) {
+        const pObj = cached.prompt;
+        if (pObj && typeof pObj === 'object' && !Array.isArray(pObj)) {
+          const ex = extractPromptObj(pObj);
+          if (ex) { prompt = ex.text; Object.assign(finalParams, ex.params); }
+        }
+        // job_type
+        const jt = parseJobType(cached.job_type);
+        let verStr = finalParams._version || ''; delete finalParams._version;
+        const nijiM = verStr.match(/niji\s*(\d+)/i), vM = verStr.match(/^(\d+(?:\.\d+)?)$/);
+        if (nijiM) finalParams.niji = nijiM[1];
+        else if (vM) { if (jt.isNiji) finalParams.niji = vM[1]; else finalParams.v = vM[1]; }
+        else if (jt.version) { if (jt.isNiji) finalParams.niji = jt.version; else finalParams.v = jt.version; }
+        if (jt.isRaw && !finalParams.raw) finalParams.raw = 'true';
+        if (!finalParams.ar && cached.width && cached.height && cached.width !== cached.height) {
+          const gcd = (a, b) => b ? gcd(b, a % b) : a, g = gcd(cached.width, cached.height);
+          finalParams.ar = `${cached.width / g}:${cached.height / g}`;
+        }
+      } else {
+        // fallback: 从 lightbox DOM 读 prompt 文字
+        const promptEl = document.querySelector('#lightboxPrompt .notranslate p');
+        if (promptEl) prompt = promptEl.textContent?.trim() || '';
+        // 读 tag buttons
+        const tagBtns = document.querySelectorAll('#lightboxPrompt button[title]');
+        for (const tb of tagBtns) {
+          const span = tb.querySelector('span.text-transparent');
+          if (!span) continue;
+          const txt = span.textContent?.trim() || '';
+          const m = txt.match(/^--(\w+)\s*(.*)/);
+          if (m) finalParams[m[1]] = m[2] || 'true';
+        }
+      }
+
+      if (seed != null) finalParams.seed = String(seed);
+      // 清理
+      for (const k of Object.keys(finalParams)) {
+        if (!finalParams[k] || finalParams[k] === 'null' || finalParams[k] === 'undefined' || finalParams[k] === '0' || finalParams[k] === 'false')
+          delete finalParams[k];
+      }
+
+      const author = firstStr(cached?.display_name, readInit()?.profile?.display_name);
+      const cli = (prompt + (Object.keys(finalParams).length ? ' ' + p2cli(finalParams) : '')).trim();
+      const desc = `${cli} Job ID: ${jobId}`;
+
+      // 4. 注入 tEXt metadata 到原始 PNG
+      let outBlob = await embedPngText(pngBlob, [
+        { keyword: 'Description', text: desc },
+        { keyword: 'Software', text: 'Midjourney / NijiExport' },
+        { keyword: 'Comment', text: JSON.stringify({ prompt: cli, jobId, seed }) },
+      ]);
+
+      // 5. 下载
+      const slug = sanitize(prompt.replace(/[,。.、]+/g, ' ').replace(/\s+/g, '_'), 48) || 'niji';
+      const dateStr = fmtDate(cached?.enqueue_time || cached?.created_at);
+      const fn = `${dateStr || 'niji'}_${slug}_${jobId}_${imgIndex}.png`;
+      dlBlob(outBlob, fn);
+
+      btn.innerHTML = '✓';
+      log(`✓ lightbox 下载: ${fn} seed=${seed ?? 'null'}`);
+    } catch (err) {
+      btn.innerHTML = '✗';
+      warn('lightbox 下载失败:', err);
+    } finally {
+      setTimeout(() => { btn.innerHTML = origHtml; delete btn.dataset.busy; }, 2000);
+    }
+  }
+
   // ============================== OBSERVER ==============================
   let st = null;
-  function sched() { if (st) return; st = setTimeout(() => { st = null; try { scanInject(); } catch (e) { warn(e); } }, 250); }
+  function sched() { if (st) return; st = setTimeout(() => { st = null; try { scanInject(); scanLightbox(); } catch (e) { warn(e); } }, 250); }
   function startObs() {
     if (!document.body) { setTimeout(startObs, 50); return; }
     new MutationObserver(sched).observe(document.body, { childList: true, subtree: true });
@@ -526,6 +675,9 @@
   // ============================== UI ==============================
   const STYLE = `
 .nj-btn-wrap{position:absolute;bottom:6px;right:6px;z-index:50;display:flex;gap:3px;align-items:center}
+.nj-lb-btn{position:relative;display:flex;align-items:center;justify-content:center;cursor:pointer;padding:6px;border-radius:9999px;color:inherit;background:transparent;border:none;transition:opacity .15s}
+.nj-lb-btn:hover{opacity:.7}
+.nj-lb-badge{position:absolute;bottom:0;right:-2px;background:#d14836;color:#fff;font-size:9px;font-weight:700;line-height:1;padding:1px 3px;border-radius:3px;pointer-events:none}
 .nj-exp-btn,.nj-sel-btn{background:rgba(30,30,34,.85);color:#fff;border:1px solid rgba(255,255,255,.15);border-radius:5px;width:28px;height:28px;cursor:pointer;font-size:14px;display:flex;align-items:center;justify-content:center;opacity:.85;transition:all .15s;backdrop-filter:blur(4px);user-select:none;padding:0;line-height:1}
 .nj-exp-btn:hover,.nj-sel-btn:hover{opacity:1;transform:scale(1.08)}
 .nj-exp-btn.nj-done{opacity:.6}
@@ -584,7 +736,7 @@
     if (panelEl) { panelEl.style.display = 'block'; refreshStat(); return; }
     panelEl = document.createElement('div'); panelEl.id = 'nj-panel';
     panelEl.innerHTML = `
-<div class="hd"><b>Niji 导出 v6.0</b><span class="cls">×</span></div>
+<div class="hd"><b>Niji 导出 v6.1</b><span class="cls">×</span></div>
 <div class="bd">
   <div class="stat" id="nj-stat"></div>
 
@@ -728,7 +880,7 @@
     if (!document.body) { setTimeout(init, 50); return; }
     injectCSS(); createFab(); startObs();
     try { uw.nijiExport = { jobCache, CONFIG, harvest, selectedJobs, exportedJids }; } catch {}
-    log('v6.0 ready');
+    log('v6.1 ready');
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', init); else init();
 })();
