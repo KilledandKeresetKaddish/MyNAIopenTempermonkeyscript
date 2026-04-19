@@ -177,6 +177,7 @@
       Object.assign(state.params,parsed.params);
     }
   }
+  const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
   // ============================== IMAGE ==============================
   function gmBlob(u){return new Promise((ok,no)=>{GM_xmlhttpRequest({method:'GET',url:u,responseType:'blob',onload:r=>r.status<300?ok(r.response):no(new Error('HTTP '+r.status)),onerror:()=>no(new Error('Net')),ontimeout:()=>no(new Error('Timeout'))});});}
@@ -661,6 +662,33 @@
       if (!prompt) {
         const promptEl = document.querySelector('#lightboxPrompt .notranslate p');
         if (promptEl) prompt = promptEl.textContent?.trim() || '';
+      }
+      // ★ 随机性缺失通常是时序问题：lightbox 文案/缓存晚于点击，做短时重试
+      if (!prompt) {
+        for (let retry = 0; retry < 6 && !prompt; retry++) {
+          await sleep(180);
+          // 触发一次全量 fiber 扫描，尽量补齐 cache
+          if (!cached && retry === 1) harvest();
+          const latest = jobCache.get(jobId);
+          if (latest) {
+            const tmp = { prompt, params: finalParams };
+            mergePromptFromJobRecord(latest, tmp);
+            prompt = tmp.prompt;
+          }
+          if (!prompt) {
+            const near2 = findJobs(btn, jobId);
+            if (near2.length) {
+              const tmp = { prompt, params: finalParams };
+              mergePromptFromJobRecord(near2[0], tmp);
+              prompt = tmp.prompt;
+              upsertJobs([near2[0]], 'lightbox-retry-fiber');
+            }
+          }
+          if (!prompt) {
+            const promptEl2 = document.querySelector('#lightboxPrompt .notranslate p');
+            if (promptEl2) prompt = promptEl2.textContent?.trim() || '';
+          }
+        }
       }
       // 读 tag buttons (无论是否命中缓存都补一遍，避免参数缺失)
       const tagBtns = document.querySelectorAll('#lightboxPrompt button[title]');
