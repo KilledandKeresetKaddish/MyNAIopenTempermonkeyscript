@@ -93,6 +93,7 @@
 
   // ============================== CACHE ==============================
   const jobCache=new Map(),cacheListeners=new Set(),selectedJobs=new Set();
+  const promptMemo=new Map(); // jobId -> { prompt, params, at }
   let reactDone=false, selectMode=false;
   function fire(){cacheListeners.forEach(fn=>{try{fn();}catch{}});}
   function upsertJobs(arr,tag=''){let a=0,e=0;for(const j of arr){if(!j||typeof j!=='object')continue;const id=j.id||j.uuid||j.job_id;if(!id||typeof id!=='string')continue;if(!(j.image_paths||j.imagePaths||j.paths||j.full_command||j.prompt||j.items))continue;const p=jobCache.get(id);if(!p){jobCache.set(id,Object.assign({},j,{id}));a++;}else{let g=false;const n=Object.assign({},p);for(const k of Object.keys(j)){if(p[k]==null&&j[k]!=null){n[k]=j[k];g=true;}}if(g){jobCache.set(id,n);e++;}}}if(a||e){log(`[${tag}] +${a}/~${e} (${jobCache.size})`);fire();}return a+e;}
@@ -151,6 +152,35 @@
   function firstStr(...v){for(const s of v)if(typeof s==='string'&&s.length)return s;return '';}
   const BOOL_RE=/^(raw|tile|turbo|relax|fast|draft|video|motion)$/i;
   function p2cli(params){return Object.entries(params).filter(([k,v])=>v&&v!=='null'&&v!=='undefined'&&!k.startsWith('_')).map(([k,v])=>(v==='true'||BOOL_RE.test(k))?`--${k}`:`--${k} ${v}`).join(' ');}
+  function parsePromptAndParamsFromText(fc){
+    const out={prompt:'',params:{}};
+    if(typeof fc!=='string'||!fc.trim())return out;
+    if(fc.includes('--')){
+      const idx=fc.indexOf('--');
+      out.prompt=fc.slice(0,idx).trim();
+      const re=/--(\w+)(?:\s+([^-\s][^\s]*(?:\s+[^-\s][^\s]*)*?))?(?=\s+--|\s*$)/g;
+      let m;while((m=re.exec(fc.slice(idx)))!==null)out.params[m[1]]=m[2]===undefined?'true':m[2].trim();
+    }else out.prompt=fc.trim();
+    return out;
+  }
+  function mergePromptFromJobRecord(jobLike, state){
+    if(!jobLike||typeof jobLike!=='object')return;
+    const pObj=jobLike.prompt;
+    if(pObj&&typeof pObj==='object'&&!Array.isArray(pObj)){
+      const ex=extractPromptObj(pObj);
+      if(ex){
+        if(!state.prompt&&ex.text)state.prompt=ex.text;
+        Object.assign(state.params,ex.params);
+      }
+    }
+    if(!state.prompt){
+      const fc=firstStr(jobLike.full_command,typeof jobLike.prompt==='string'?jobLike.prompt:'',jobLike.prompt_text);
+      const parsed=parsePromptAndParamsFromText(fc);
+      if(parsed.prompt)state.prompt=parsed.prompt;
+      Object.assign(state.params,parsed.params);
+    }
+  }
+  const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
   // ============================== IMAGE ==============================
   function gmBlob(u){return new Promise((ok,no)=>{GM_xmlhttpRequest({method:'GET',url:u,responseType:'blob',onload:r=>r.status<300?ok(r.response):no(new Error('HTTP '+r.status)),onerror:()=>no(new Error('Net')),ontimeout:()=>no(new Error('Timeout'))});});}
@@ -595,15 +625,18 @@
         }
       } catch {}
 
-      // 3. 获取 prompt + params (从缓存或 React fiber)
+      // 3. 获取 prompt + params (从缓存 / fiber / DOM / 记忆)
       let prompt = '', finalParams = {};
+      const memo = promptMemo.get(jobId);
+      if (memo) {
+        prompt = memo.prompt || '';
+        Object.assign(finalParams, memo.params || {});
+      }
       const cached = jobCache.get(jobId);
       if (cached) {
-        const pObj = cached.prompt;
-        if (pObj && typeof pObj === 'object' && !Array.isArray(pObj)) {
-          const ex = extractPromptObj(pObj);
-          if (ex) { prompt = ex.text; Object.assign(finalParams, ex.params); }
-        }
+        const tmp = { prompt, params: finalParams };
+        mergePromptFromJobRecord(cached, tmp);
+        prompt = tmp.prompt;
         // job_type
         const jt = parseJobType(cached.job_type);
         let verStr = finalParams._version || ''; delete finalParams._version;
@@ -616,19 +649,64 @@
           const gcd = (a, b) => b ? gcd(b, a % b) : a, g = gcd(cached.width, cached.height);
           finalParams.ar = `${cached.width / g}:${cached.height / g}`;
         }
-      } else {
-        // fallback: 从 lightbox DOM 读 prompt 文字
+      }
+      // 再尝试从 lightbox 附近 React fiber 抓取一次（有时缓存尚未完整）
+      if (!prompt) {
+        const tmp = { prompt, params: finalParams };
+        const near = findJobs(btn, jobId);
+        if (near.length) {
+          mergePromptFromJobRecord(near[0], tmp);
+          prompt = tmp.prompt;
+          if (cached) upsertJobs([near[0]], 'lightbox-fiber');
+        }
+      }
+
+      // fallback: 从 lightbox DOM 读 prompt 文字
+      if (!prompt) {
         const promptEl = document.querySelector('#lightboxPrompt .notranslate p');
         if (promptEl) prompt = promptEl.textContent?.trim() || '';
-        // 读 tag buttons
-        const tagBtns = document.querySelectorAll('#lightboxPrompt button[title]');
-        for (const tb of tagBtns) {
-          const span = tb.querySelector('span.text-transparent');
-          if (!span) continue;
-          const txt = span.textContent?.trim() || '';
-          const m = txt.match(/^--(\w+)\s*(.*)/);
-          if (m) finalParams[m[1]] = m[2] || 'true';
+      }
+      // ★ 随机性缺失通常是时序问题：lightbox 文案/缓存晚于点击，做短时重试
+      if (!prompt) {
+        for (let retry = 0; retry < 6 && !prompt; retry++) {
+          await sleep(180);
+          // 触发一次全量 fiber 扫描，尽量补齐 cache
+          if (!cached && retry === 1) harvest();
+          const latest = jobCache.get(jobId);
+          if (latest) {
+            const tmp = { prompt, params: finalParams };
+            mergePromptFromJobRecord(latest, tmp);
+            prompt = tmp.prompt;
+          }
+          if (!prompt) {
+            const near2 = findJobs(btn, jobId);
+            if (near2.length) {
+              const tmp = { prompt, params: finalParams };
+              mergePromptFromJobRecord(near2[0], tmp);
+              prompt = tmp.prompt;
+              upsertJobs([near2[0]], 'lightbox-retry-fiber');
+            }
+          }
+          if (!prompt) {
+            const promptEl2 = document.querySelector('#lightboxPrompt .notranslate p');
+            if (promptEl2) prompt = promptEl2.textContent?.trim() || '';
+          }
         }
+      }
+      // 读 tag buttons (无论是否命中缓存都补一遍，避免参数缺失)
+      const tagBtns = document.querySelectorAll('#lightboxPrompt button[title]');
+      for (const tb of tagBtns) {
+        const span = tb.querySelector('span.text-transparent');
+        if (!span) continue;
+        const txt = span.textContent?.trim() || '';
+        const m = txt.match(/^--(\w+)\s*(.*)/);
+        if (m && !finalParams[m[1]]) finalParams[m[1]] = m[2] || 'true';
+      }
+      // 记忆本 job 的 prompt/params，避免同一 job 下一张图再次丢失
+      if (prompt) {
+        promptMemo.set(jobId, { prompt, params: Object.assign({}, finalParams), at: Date.now() });
+      } else {
+        warn(`lightbox prompt 为空: ${jobId.slice(0, 8)}，将只写参数。可在控制台运行 window.NijiExportDebug.dump("${jobId}") 排查`);
       }
 
       if (seed != null) finalParams.seed = String(seed);
@@ -801,6 +879,39 @@
     window.addEventListener('load', () => { sched(); setTimeout(() => { if (!reactDone) harvest(); }, 2000); });
     setInterval(sched, 3000);
   }
+
+  // ============================== DEBUG HELPERS ==============================
+  uw.NijiExportDebug = Object.assign(uw.NijiExportDebug || {}, {
+    dump(jobId) {
+      const id = (jobId || location.pathname.match(/\/jobs\/([a-f0-9-]{36})/i)?.[1] || '').toLowerCase();
+      if (!id) { console.warn('[NijiExportDebug] 未提供 jobId 且当前 URL 不含 /jobs/{id}'); return null; }
+      const cached = jobCache.get(id) || null;
+      const memo = promptMemo.get(id) || null;
+      const near = findJobs(document.querySelector('button[title="Download Image"]') || document.body, id);
+      const promptEl = document.querySelector('#lightboxPrompt .notranslate p');
+      const tags = [...document.querySelectorAll('#lightboxPrompt button[title] span.text-transparent')].map(x => x.textContent?.trim()).filter(Boolean);
+      const report = {
+        jobId: id,
+        hasCache: !!cached,
+        cachePromptType: cached ? (Array.isArray(cached.prompt) ? 'array' : typeof cached.prompt) : null,
+        cacheDecodedPrompt: cached?.prompt?.decodedPrompt ?? null,
+        cacheFullCommand: cached?.full_command ?? null,
+        cachePromptText: cached?.prompt_text ?? null,
+        memo,
+        nearFiberCount: near.length,
+        nearFiberSample: near[0] ? {
+          prompt: near[0].prompt ?? null,
+          full_command: near[0].full_command ?? null,
+          prompt_text: near[0].prompt_text ?? null,
+          job_type: near[0].job_type ?? null,
+        } : null,
+        domPrompt: promptEl?.textContent?.trim() || null,
+        domTags: tags,
+      };
+      console.log('[NijiExportDebug] dump', report);
+      return report;
+    }
+  });
 
   // ============================== UI ==============================
   const STYLE = `
