@@ -151,6 +151,17 @@
   function firstStr(...v){for(const s of v)if(typeof s==='string'&&s.length)return s;return '';}
   const BOOL_RE=/^(raw|tile|turbo|relax|fast|draft|video|motion)$/i;
   function p2cli(params){return Object.entries(params).filter(([k,v])=>v&&v!=='null'&&v!=='undefined'&&!k.startsWith('_')).map(([k,v])=>(v==='true'||BOOL_RE.test(k))?`--${k}`:`--${k} ${v}`).join(' ');}
+  function parsePromptAndParamsFromText(fc){
+    const out={prompt:'',params:{}};
+    if(typeof fc!=='string'||!fc.trim())return out;
+    if(fc.includes('--')){
+      const idx=fc.indexOf('--');
+      out.prompt=fc.slice(0,idx).trim();
+      const re=/--(\w+)(?:\s+([^-\s][^\s]*(?:\s+[^-\s][^\s]*)*?))?(?=\s+--|\s*$)/g;
+      let m;while((m=re.exec(fc.slice(idx)))!==null)out.params[m[1]]=m[2]===undefined?'true':m[2].trim();
+    }else out.prompt=fc.trim();
+    return out;
+  }
 
   // ============================== IMAGE ==============================
   function gmBlob(u){return new Promise((ok,no)=>{GM_xmlhttpRequest({method:'GET',url:u,responseType:'blob',onload:r=>r.status<300?ok(r.response):no(new Error('HTTP '+r.status)),onerror:()=>no(new Error('Net')),ontimeout:()=>no(new Error('Timeout'))});});}
@@ -604,6 +615,12 @@
           const ex = extractPromptObj(pObj);
           if (ex) { prompt = ex.text; Object.assign(finalParams, ex.params); }
         }
+        if (!prompt) {
+          const fc = firstStr(cached.full_command, typeof cached.prompt === 'string' ? cached.prompt : '', cached.prompt_text);
+          const parsed = parsePromptAndParamsFromText(fc);
+          if (parsed.prompt) prompt = parsed.prompt;
+          Object.assign(finalParams, parsed.params);
+        }
         // job_type
         const jt = parseJobType(cached.job_type);
         let verStr = finalParams._version || ''; delete finalParams._version;
@@ -616,19 +633,21 @@
           const gcd = (a, b) => b ? gcd(b, a % b) : a, g = gcd(cached.width, cached.height);
           finalParams.ar = `${cached.width / g}:${cached.height / g}`;
         }
-      } else {
-        // fallback: 从 lightbox DOM 读 prompt 文字
+      }
+
+      // fallback: 从 lightbox DOM 读 prompt 文字
+      if (!prompt) {
         const promptEl = document.querySelector('#lightboxPrompt .notranslate p');
         if (promptEl) prompt = promptEl.textContent?.trim() || '';
-        // 读 tag buttons
-        const tagBtns = document.querySelectorAll('#lightboxPrompt button[title]');
-        for (const tb of tagBtns) {
-          const span = tb.querySelector('span.text-transparent');
-          if (!span) continue;
-          const txt = span.textContent?.trim() || '';
-          const m = txt.match(/^--(\w+)\s*(.*)/);
-          if (m) finalParams[m[1]] = m[2] || 'true';
-        }
+      }
+      // 读 tag buttons (无论是否命中缓存都补一遍，避免参数缺失)
+      const tagBtns = document.querySelectorAll('#lightboxPrompt button[title]');
+      for (const tb of tagBtns) {
+        const span = tb.querySelector('span.text-transparent');
+        if (!span) continue;
+        const txt = span.textContent?.trim() || '';
+        const m = txt.match(/^--(\w+)\s*(.*)/);
+        if (m && !finalParams[m[1]]) finalParams[m[1]] = m[2] || 'true';
       }
 
       if (seed != null) finalParams.seed = String(seed);
