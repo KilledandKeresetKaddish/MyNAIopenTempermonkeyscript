@@ -2,7 +2,7 @@
 // @name         Niji Journey 批量/逐组导出
 // @name:zh-CN   Niji Journey 批量/逐组导出
 // @namespace    https://nijijourney.com/
-// @version      6.2.0
+// @version      6.2.1
 // @description  Niji/Midjourney 图片批量导出工具 | 选择模式批量导出 | 2x2 网格合成 | Lightbox 原图+Seed 下载 | 参考图批量下载 (SR/CR/IP) | WebP/PNG 格式 | 质量/缩放可调 | 自动获取 Seed (API) | 完整 prompt + 参数提取 (React fiber) | mem-portable-metadata-v1 XMP | PNG tEXt | NJEX 签名 | CreatorTool 标记
 // @author       adonais & Claude
 // @match        https://nijijourney.com/*
