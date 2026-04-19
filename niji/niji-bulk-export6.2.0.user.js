@@ -166,9 +166,12 @@
   function mergePromptFromJobRecord(jobLike, state){
     if(!jobLike||typeof jobLike!=='object')return;
     const pObj=jobLike.prompt;
-    if(!state.prompt&&pObj&&typeof pObj==='object'&&!Array.isArray(pObj)){
+    if(pObj&&typeof pObj==='object'&&!Array.isArray(pObj)){
       const ex=extractPromptObj(pObj);
-      if(ex){if(ex.text)state.prompt=ex.text;Object.assign(state.params,ex.params);}
+      if(ex){
+        if(!state.prompt&&ex.text)state.prompt=ex.text;
+        Object.assign(state.params,ex.params);
+      }
     }
     if(!state.prompt){
       const fc=firstStr(jobLike.full_command,typeof jobLike.prompt==='string'?jobLike.prompt:'',jobLike.prompt_text);
