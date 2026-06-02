@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Clipboard Prompt Runner v3.1
 // @namespace    https://example.local/
-// @version      3.1.0
+// @version      3.1.1
 // @description  从剪贴板读取 subject，按模板 / sex / tags / Quick Runs 自动生成 NovelAI 图片（无脚本内确认弹窗）
 // @author       Adonais
 // @match        https://novelai.net/image*
@@ -39,6 +39,8 @@
     maxWaitMsPerGeneration: 180000,
     settleAfterClickMs: 1500,
     pollIntervalMs: 1000,
+    uiCollapsed: false,
+    dockPosition: null,
     quickRuns: [
       {
         name: '单girl',
@@ -83,6 +85,7 @@
   let draft = null;
   let running = false;
   let settingsDialog = null;
+  let gearClickSuppressed = false;
 
   function deepClone(obj) {
     return JSON.parse(JSON.stringify(obj));
@@ -152,6 +155,15 @@
       }
 
       if ('hotkeyEnabled' in saved) merged.hotkeyEnabled = !!saved.hotkeyEnabled;
+      if ('uiCollapsed' in saved) merged.uiCollapsed = !!saved.uiCollapsed;
+
+      if (saved.dockPosition && typeof saved.dockPosition === 'object') {
+        const x = Number(saved.dockPosition.x);
+        const y = Number(saved.dockPosition.y);
+        if (Number.isFinite(x) && Number.isFinite(y)) {
+          merged.dockPosition = { x, y };
+        }
+      }
 
       if (saved.hotkey && typeof saved.hotkey === 'object') {
         merged.hotkey = {
@@ -557,21 +569,118 @@
     updateDock();
   }
 
+  function clampDockPosition(x, y) {
+    const dock = document.getElementById('nai-runner-dock');
+    const rect = dock?.getBoundingClientRect();
+    const width = rect?.width || 48;
+    const height = rect?.height || 48;
+    const margin = 6;
+    return {
+      x: Math.max(margin, Math.min(window.innerWidth - width - margin, x)),
+      y: Math.max(margin, Math.min(window.innerHeight - height - margin, y)),
+    };
+  }
+
+  function applyDockPosition() {
+    const dock = document.getElementById('nai-runner-dock');
+    if (!dock) return;
+
+    if (state?.dockPosition) {
+      const pos = clampDockPosition(state.dockPosition.x, state.dockPosition.y);
+      dock.style.left = `${pos.x}px`;
+      dock.style.top = `${pos.y}px`;
+      dock.style.right = 'auto';
+      dock.style.bottom = 'auto';
+    } else {
+      dock.style.left = '';
+      dock.style.top = '';
+      dock.style.right = '';
+      dock.style.bottom = '';
+    }
+  }
+
+  function bindGearDrag(gear) {
+    if (!gear) return;
+
+    gear.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      const dock = document.getElementById('nai-runner-dock');
+      if (!dock) return;
+
+      const rect = dock.getBoundingClientRect();
+      const startX = e.clientX;
+      const startY = e.clientY;
+      const startLeft = rect.left;
+      const startTop = rect.top;
+      let dragged = false;
+
+      gear.setPointerCapture?.(e.pointerId);
+
+      const onMove = (moveEvent) => {
+        const dx = moveEvent.clientX - startX;
+        const dy = moveEvent.clientY - startY;
+        if (!dragged && Math.hypot(dx, dy) < 4) return;
+        dragged = true;
+        dock.classList.add('nai-runner-dock-dragging');
+        const pos = clampDockPosition(startLeft + dx, startTop + dy);
+        dock.style.left = `${pos.x}px`;
+        dock.style.top = `${pos.y}px`;
+        dock.style.right = 'auto';
+        dock.style.bottom = 'auto';
+      };
+
+      const onUp = (upEvent) => {
+        gear.releasePointerCapture?.(upEvent.pointerId);
+        gear.removeEventListener('pointermove', onMove);
+        gear.removeEventListener('pointerup', onUp);
+        gear.removeEventListener('pointercancel', onUp);
+        dock.classList.remove('nai-runner-dock-dragging');
+
+        if (dragged) {
+          const nextRect = dock.getBoundingClientRect();
+          state.dockPosition = clampDockPosition(nextRect.left, nextRect.top);
+          saveState();
+          gearClickSuppressed = true;
+          setTimeout(() => {
+            gearClickSuppressed = false;
+          }, 0);
+        }
+      };
+
+      gear.addEventListener('pointermove', onMove);
+      gear.addEventListener('pointerup', onUp);
+      gear.addEventListener('pointercancel', onUp);
+    });
+  }
+
   function updateDock() {
+    const dock = document.getElementById('nai-runner-dock');
     const main = document.getElementById('nai-runner-dock-main');
     const quick = document.getElementById('nai-runner-dock-quick');
-    if (!main || !quick) return;
+    if (!dock || !main || !quick) return;
+
+    dock.classList.toggle('nai-runner-dock-collapsed', !!state.uiCollapsed);
+
+    const gearTitle = state.uiCollapsed
+      ? '设置（界面已隐藏；拖动可移动齿轮）'
+      : '设置（拖动可移动面板）';
 
     main.innerHTML = `
-      <button type="button" id="nai-runner-run-current" class="nai-btn nai-btn-primary" ${running ? 'disabled' : ''}>
-        ${running ? 'Running...' : 'Run Current'}
-      </button>
-      <button type="button" id="nai-runner-open-settings" class="nai-btn nai-btn-ghost" ${running ? 'disabled' : ''}>
-        ⚙
-      </button>
+      ${state.uiCollapsed ? '' : `
+        <button type="button" id="nai-runner-run-current" class="nai-btn nai-btn-primary" ${running ? 'disabled' : ''}>
+          ${running ? 'Running...' : 'Run Current'}
+        </button>
+      `}
+      <button
+        type="button"
+        id="nai-runner-open-settings"
+        class="nai-btn nai-btn-ghost nai-btn-gear"
+        title="${escapeAttr(gearTitle)}"
+        aria-label="${escapeAttr(gearTitle)}"
+      >⚙</button>
     `;
 
-    quick.innerHTML = state.quickRuns.map((item, idx) => `
+    quick.innerHTML = state.uiCollapsed ? '' : state.quickRuns.map((item, idx) => `
       <button
         type="button"
         class="nai-btn nai-btn-quick"
@@ -582,7 +691,13 @@
     `).join('');
 
     document.getElementById('nai-runner-run-current')?.addEventListener('click', runCurrentState);
-    document.getElementById('nai-runner-open-settings')?.addEventListener('click', openSettingsDialog);
+    const gear = document.getElementById('nai-runner-open-settings');
+    gear?.addEventListener('click', () => {
+      if (gearClickSuppressed) return;
+      openSettingsDialog();
+    });
+    bindGearDrag(gear);
+    applyDockPosition();
 
     quick.querySelectorAll('[data-quick-run]').forEach(btn => {
       btn.addEventListener('click', async () => {
@@ -679,6 +794,10 @@
               <label class="nai-toggle">
                 <input type="checkbox" id="nai-hotkey-enabled" ${draft.hotkeyEnabled ? 'checked' : ''}>
                 <span>启用热键 Alt + Shift + Q</span>
+              </label>
+              <label class="nai-toggle">
+                <input type="checkbox" id="nai-ui-collapsed" ${draft.uiCollapsed ? 'checked' : ''}>
+                <span>隐藏主界面和 Quick Runs，只保留可拖动齿轮</span>
               </label>
             </div>
           </section>
@@ -781,6 +900,7 @@
     draft.sexOrderFirst = settingsDialog.querySelector('#nai-sex-order')?.value === 'boy' ? 'boy' : 'girl';
     draft.runMode = settingsDialog.querySelector('#nai-run-mode')?.value || draft.runMode;
     draft.hotkeyEnabled = !!settingsDialog.querySelector('#nai-hotkey-enabled')?.checked;
+    draft.uiCollapsed = !!settingsDialog.querySelector('#nai-ui-collapsed')?.checked;
 
     const selectedSexes = [];
     if (settingsDialog.querySelector('#nai-sex-girl')?.checked) selectedSexes.push('girl');
@@ -843,7 +963,7 @@
     settingsDialog.querySelector('#nai-settings-close')?.addEventListener('click', () => settingsDialog.close());
     settingsDialog.querySelector('#nai-cancel-settings')?.addEventListener('click', () => settingsDialog.close());
 
-    ['#nai-template', '#nai-sex-girl', '#nai-sex-boy', '#nai-sex-order', '#nai-run-mode', '#nai-hotkey-enabled']
+    ['#nai-template', '#nai-sex-girl', '#nai-sex-boy', '#nai-sex-order', '#nai-run-mode', '#nai-hotkey-enabled', '#nai-ui-collapsed']
       .forEach(sel => {
         const el = settingsDialog.querySelector(sel);
         if (!el) return;
@@ -1049,6 +1169,18 @@
         justify-content: flex-end;
       }
 
+      #nai-runner-dock.nai-runner-dock-collapsed {
+        max-width: 48px;
+      }
+
+      #nai-runner-dock.nai-runner-dock-collapsed #nai-runner-dock-quick {
+        display: none;
+      }
+
+      #nai-runner-dock.nai-runner-dock-dragging {
+        user-select: none;
+      }
+
       .nai-btn {
         border: 0;
         border-radius: 999px;
@@ -1072,6 +1204,22 @@
       .nai-btn-ghost {
         background: #2b3043;
         color: #f3f5ff;
+      }
+
+      .nai-btn-gear {
+        width: 44px;
+        height: 44px;
+        padding: 0;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 20px;
+        touch-action: none;
+        cursor: grab;
+      }
+
+      .nai-runner-dock-dragging .nai-btn-gear {
+        cursor: grabbing;
       }
 
       .nai-btn-quick {
@@ -1405,9 +1553,10 @@
     injectStyles();
     ensureDialogs();
     createDock();
+    window.addEventListener('resize', applyDockPosition);
     bindHotkey();
     installMenuCommands();
-    toast('Prompt Runner v3.1 已加载');
+    toast('Prompt Runner v3.1.1 已加载');
   }
 
   if (document.readyState === 'loading') {
