@@ -2,7 +2,7 @@
 // @name         Niji Journey 批量/逐组导出
 // @name:zh-CN   Niji Journey 批量/逐组导出
 // @namespace    https://nijijourney.com/
-// @version      6.2.3
+// @version      6.2.4
 // @description  Niji/Midjourney 图片批量导出工具 | 选择模式批量导出 | 2x2 网格合成 | Lightbox 原图+Seed 下载 | 参考图批量下载 (SR/CR/IP) | WebP/PNG 格式 | 质量/缩放可调 | 自动获取 Seed (API) | 完整 prompt + 参数提取 (React fiber) | mem-portable-metadata-v1 XMP | PNG tEXt | NJEX 签名 | CreatorTool 标记
 // @author       adonais & Claude
 // @match        https://nijijourney.com/*
@@ -650,15 +650,25 @@
     }
   }
 
+  async function assertPngBlob(blob, url) {
+    if (!blob || !blob.size) throw new Error('empty response');
+    if (blob.type && !/png/i.test(blob.type)) throw new Error(`not PNG content-type (${blob.type})`);
+    const sig = new Uint8Array(await blob.slice(0, 8).arrayBuffer());
+    const pngSig = [137, 80, 78, 71, 13, 10, 26, 10];
+    if (sig.length < pngSig.length || pngSig.some((v, i) => sig[i] !== v)) {
+      throw new Error(`not PNG bytes (${url})`);
+    }
+  }
+
   async function lightboxOriginalBlob(candidates) {
     let lastErr = null;
     for (const url of uniq(candidates)) {
       try {
         log(`下载原图: ${url}`);
         const blob = await gmBlobWithReferrerFallback(url);
-        if (!/\.png(?:$|[?#])/i.test(url) && blob?.type && !/png/i.test(blob.type)) {
-          throw new Error(`not PNG (${blob.type})`);
-        }
+        // 即使 URL 以 .png 结尾，CDN 也可能 200 返回 HTML/JSON fallback；必须验 MIME 与 PNG 魔数，
+        // 否则 embedPngText 会把非 PNG 当 PNG 处理，导致报错或生成损坏文件。
+        await assertPngBlob(blob, url);
         return { blob, url };
       } catch (err) {
         lastErr = err;
