@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Anlas Threshold Guard
 // @namespace    https://example.local/
-// @version      1.0.0
+// @version      1.0.1
 // @description  在 NovelAI 图片生成按钮被点击时读取页面显示的 Anlas 消耗，超过自定义阈值则弹出确认警告，取消确认会拦截本次生成。
 // @author       Adonais
 // @match        https://novelai.net/image*
@@ -15,6 +15,8 @@
   'use strict';
 
   const STORAGE_KEY = 'nai_anlas_threshold_guard_v1';
+  const COST_LABEL_RE = /anlas|消耗|花费|cost/i;
+  const NUMERIC_LEAF_SELECTOR = 'span, div, p, strong, b';
   const DEFAULTS = {
     enabled: true,
     threshold: 0,
@@ -60,6 +62,20 @@
     return (el?.innerText || el?.textContent || '').replace(/\s+/g, ' ').trim();
   }
 
+  function ownTextOf(el) {
+    if (!el) return '';
+    return Array.from(el.childNodes)
+      .filter(node => node.nodeType === Node.TEXT_NODE)
+      .map(node => node.textContent || '')
+      .join(' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
+  function uniqueElements(items) {
+    return [...new Set(items.filter(Boolean))];
+  }
+
   function parseNumberFromText(text) {
     const normalized = String(text || '').replace(/,/g, '').trim();
     const exact = normalized.match(/^-?\d+(?:\.\d+)?$/);
@@ -85,14 +101,52 @@
       .find(button => /Generate/i.test(textOf(button)) && !/Cancel|Generating|Queue|Queued|Waiting|Stop/i.test(textOf(button))) || null;
   }
 
-  function getLeafTextElements() {
-    return Array.from(document.querySelectorAll('span, div, p, strong, b'))
-      .filter(el => isVisible(el) && textOf(el) && Array.from(el.children).every(child => !textOf(child)));
+  function isNumericLeaf(el) {
+    return isVisible(el) && textOf(el) && Array.from(el.children).every(child => !textOf(child));
   }
 
-  function buildCandidate(el, source, generateButton) {
+  function getLeafTextElements(root = document) {
+    return Array.from(root.querySelectorAll(NUMERIC_LEAF_SELECTOR)).filter(isNumericLeaf);
+  }
+
+  function getNumberLeaves(root = document) {
+    return getLeafTextElements(root).filter(el => Number.isFinite(parseNumberFromText(textOf(el))));
+  }
+
+  function numericLeafCount(root) {
+    return getNumberLeaves(root).length;
+  }
+
+  function siblingText(el) {
+    const siblings = [el?.previousElementSibling, el?.nextElementSibling].filter(isVisible);
+    return siblings.map(textOf).join(' ');
+  }
+
+  function hasLocalCostHint(el) {
+    const localText = [textOf(el), ownTextOf(el), siblingText(el)].join(' ');
+    if (COST_LABEL_RE.test(localText)) return true;
+
+    const compactScopes = [el.parentElement, el.parentElement?.parentElement]
+      .filter(scope => scope && isVisible(scope) && textOf(scope).length <= 250 && numericLeafCount(scope) <= 4);
+    return compactScopes.some(scope => COST_LABEL_RE.test(textOf(scope)));
+  }
+
+  function labelDistance(el, labelEl) {
+    if (!el || !labelEl) return 100000;
+    const rect = el.getBoundingClientRect();
+    const labelRect = labelEl.getBoundingClientRect();
+    return Math.hypot(
+      rect.left + rect.width / 2 - (labelRect.left + labelRect.width / 2),
+      rect.top + rect.height / 2 - (labelRect.top + labelRect.height / 2)
+    );
+  }
+
+  function buildCandidate(el, source, generateButton, options = {}) {
     const value = parseNumberFromText(textOf(el));
     if (!Number.isFinite(value)) return null;
+    const localCostHint = hasLocalCostHint(el);
+    if (options.requireLocalCostHint && !localCostHint) return null;
+
     const rect = el.getBoundingClientRect();
     const buttonRect = generateButton?.getBoundingClientRect?.();
     const centerX = rect.left + rect.width / 2;
@@ -104,17 +158,18 @@
       distance = Math.hypot(centerX - buttonX, centerY - buttonY);
     }
 
-    const ancestryText = textOf(el.closest('section, aside, form, [role="dialog"], [class]') || el.parentElement || el);
+    const distanceFromLabel = labelDistance(el, options.labelEl);
     let score = 0;
-    if (/anlas/i.test(ancestryText)) score += 1000;
-    if (/cost|消耗|花费/i.test(ancestryText)) score += 250;
     if (source === 'custom selector') score += 2000;
     if (source === 'anlas label') score += 1200;
-    if (source === 'nearest number') score += Math.max(0, 400 - distance);
+    if (localCostHint) score += 700;
+    if (COST_LABEL_RE.test(textOf(el))) score += 300;
+    if (options.labelEl) score += Math.max(0, 500 - distanceFromLabel);
+    score += Math.max(0, 300 - distance);
     if (value < 0) score -= 500;
     if (value > 100000) score -= 500;
 
-    return { value, el, source, score, distance };
+    return { value, el, source, score, distance, distanceFromLabel, localCostHint };
   }
 
   function detectFromCustomSelector(generateButton) {
@@ -131,21 +186,30 @@
 
   function detectFromAnlasLabels(generateButton) {
     const labelNodes = Array.from(document.querySelectorAll('body *'))
-      .filter(el => isVisible(el) && /anlas/i.test(textOf(el)));
+      .filter(el => {
+        if (!isVisible(el)) return false;
+        const ownOrSmallText = [ownTextOf(el), textOf(el).length <= 120 ? textOf(el) : ''].join(' ');
+        return COST_LABEL_RE.test(ownOrSmallText);
+      });
     const candidates = [];
 
     for (const label of labelNodes) {
-      const scopes = [label, label.parentElement, label.parentElement?.parentElement, label.closest('section, aside, form, [class]')]
-        .filter(Boolean);
-      for (const scope of scopes) {
-        for (const el of scope.querySelectorAll('span, div, p, strong, b')) {
-          const candidate = buildCandidate(el, 'anlas label', generateButton);
-          if (candidate) candidates.push(candidate);
-        }
+      const scopes = uniqueElements([label, label.parentElement, label.parentElement?.parentElement, label.parentElement?.parentElement?.parentElement])
+        .filter(scope => isVisible(scope) && COST_LABEL_RE.test(textOf(scope)) && textOf(scope).length <= 300 && numericLeafCount(scope) <= 4);
+
+      const nearbyLeaves = uniqueElements([
+        ...scopes.flatMap(scope => getNumberLeaves(scope)),
+        label.previousElementSibling,
+        label.nextElementSibling,
+      ]).filter(el => el && Number.isFinite(parseNumberFromText(textOf(el))));
+
+      for (const el of nearbyLeaves) {
+        const candidate = buildCandidate(el, 'anlas label', generateButton, { labelEl: label, requireLocalCostHint: true });
+        if (candidate) candidates.push(candidate);
       }
     }
 
-    return candidates.sort((a, b) => b.score - a.score)[0] || null;
+    return candidates.sort(compareCandidates)[0] || null;
   }
 
   function detectNearestNumericLeaf(generateButton) {
@@ -153,29 +217,32 @@
       .map(el => buildCandidate(el, 'nearest number', generateButton))
       .filter(Boolean)
       .filter(candidate => candidate.value >= 0 && candidate.distance < 600)
-      .sort((a, b) => b.score - a.score);
+      .sort(compareCandidates);
     return candidates[0] || null;
   }
 
-  function detectAnlasCost() {
-    const generateButton = getCurrentGenerateButton();
+  function compareCandidates(a, b) {
+    return (b.score - a.score) || (a.distance - b.distance) || (a.distanceFromLabel - b.distanceFromLabel);
+  }
+
+  function detectAnlasCost(generateButton = getCurrentGenerateButton()) {
     const candidates = [
       detectFromCustomSelector(generateButton),
       detectFromAnlasLabels(generateButton),
       detectNearestNumericLeaf(generateButton),
-    ].filter(Boolean).sort((a, b) => b.score - a.score);
+    ].filter(Boolean).sort(compareCandidates);
 
     lastDetection = candidates[0] || null;
     return lastDetection;
   }
 
-  function shouldBlockGeneration() {
+  function shouldBlockGeneration(generateButton) {
     if (!state.enabled) return false;
 
     const threshold = Number(state.threshold);
     if (!Number.isFinite(threshold)) return false;
 
-    const detection = detectAnlasCost();
+    const detection = detectAnlasCost(generateButton);
     if (!detection || !Number.isFinite(detection.value)) {
       const proceedWithoutReading = window.confirm(
         'NovelAI Anlas 阈值警告：未能可靠读取当前页面显示的 Anlas 消耗。\n\n'
@@ -201,7 +268,7 @@
     const generateButton = getGenerateButtonFromTarget(event.target);
     if (!generateButton) return;
 
-    if (shouldBlockGeneration()) {
+    if (shouldBlockGeneration(generateButton)) {
       event.preventDefault();
       event.stopPropagation();
       event.stopImmediatePropagation();
