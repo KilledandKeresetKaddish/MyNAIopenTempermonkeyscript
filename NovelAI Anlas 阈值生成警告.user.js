@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Anlas Threshold Guard
 // @namespace    https://example.local/
-// @version      1.0.1
+// @version      1.0.2
 // @description  在 NovelAI 图片生成按钮被点击时读取页面显示的 Anlas 消耗，超过自定义阈值则弹出确认警告，取消确认会拦截本次生成。
 // @author       Adonais
 // @match        https://novelai.net/image*
@@ -161,6 +161,7 @@
     const distanceFromLabel = labelDistance(el, options.labelEl);
     let score = 0;
     if (source === 'custom selector') score += 2000;
+    if (source === 'generate button anlas') score += 1800;
     if (source === 'anlas label') score += 1200;
     if (localCostHint) score += 700;
     if (COST_LABEL_RE.test(textOf(el))) score += 300;
@@ -170,6 +171,34 @@
     if (value > 100000) score -= 500;
 
     return { value, el, source, score, distance, distanceFromLabel, localCostHint };
+  }
+
+  function detectFromGenerateButtonAnlas(generateButton) {
+    if (!generateButton || !isVisible(generateButton)) return null;
+
+    const labelNodes = Array.from(generateButton.querySelectorAll(NUMERIC_LEAF_SELECTOR))
+      .filter(el => isVisible(el) && COST_LABEL_RE.test(textOf(el)));
+    const numberLeaves = getNumberLeaves(generateButton).filter(el => el !== generateButton);
+    const candidates = [];
+
+    for (const label of labelNodes) {
+      for (const el of numberLeaves) {
+        const candidate = buildCandidate(el, 'generate button anlas', generateButton, { labelEl: label });
+        if (!candidate) continue;
+
+        const numberRect = el.getBoundingClientRect();
+        const labelRect = label.getBoundingClientRect();
+        const sameRow = Math.abs(
+          (numberRect.top + numberRect.height / 2) - (labelRect.top + labelRect.height / 2)
+        ) <= Math.max(numberRect.height, labelRect.height, 1);
+
+        if (sameRow) candidate.score += 500;
+        if (numberRect.right <= labelRect.left + 12) candidate.score += 250;
+        candidates.push(candidate);
+      }
+    }
+
+    return candidates.sort(compareCandidates)[0] || null;
   }
 
   function detectFromCustomSelector(generateButton) {
@@ -188,8 +217,7 @@
     const labelNodes = Array.from(document.querySelectorAll('body *'))
       .filter(el => {
         if (!isVisible(el)) return false;
-        const ownOrSmallText = [ownTextOf(el), textOf(el).length <= 120 ? textOf(el) : ''].join(' ');
-        return COST_LABEL_RE.test(ownOrSmallText);
+        return COST_LABEL_RE.test(ownTextOf(el));
       });
     const candidates = [];
 
@@ -228,6 +256,7 @@
   function detectAnlasCost(generateButton = getCurrentGenerateButton()) {
     const candidates = [
       detectFromCustomSelector(generateButton),
+      detectFromGenerateButtonAnlas(generateButton),
       detectFromAnlasLabels(generateButton),
       detectNearestNumericLeaf(generateButton),
     ].filter(Boolean).sort(compareCandidates);
