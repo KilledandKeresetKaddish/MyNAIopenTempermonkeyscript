@@ -2,7 +2,7 @@
 // @name         Niji Journey 批量/逐组导出
 // @name:zh-CN   Niji Journey 批量/逐组导出
 // @namespace    https://nijijourney.com/
-// @version      6.2.1
+// @version      6.2.4
 // @description  Niji/Midjourney 图片批量导出工具 | 选择模式批量导出 | 2x2 网格合成 | Lightbox 原图+Seed 下载 | 参考图批量下载 (SR/CR/IP) | WebP/PNG 格式 | 质量/缩放可调 | 自动获取 Seed (API) | 完整 prompt + 参数提取 (React fiber) | mem-portable-metadata-v1 XMP | PNG tEXt | NJEX 签名 | CreatorTool 标记
 // @author       adonais & Claude
 // @match        https://nijijourney.com/*
@@ -183,7 +183,7 @@
   const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 
   // ============================== IMAGE ==============================
-  function gmBlob(u){return new Promise((ok,no)=>{GM_xmlhttpRequest({method:'GET',url:u,responseType:'blob',onload:r=>r.status<300?ok(r.response):no(new Error('HTTP '+r.status)),onerror:()=>no(new Error('Net')),ontimeout:()=>no(new Error('Timeout'))});});}
+  function gmBlob(u,opt={}){return new Promise((ok,no)=>{GM_xmlhttpRequest({method:'GET',url:u,responseType:'blob',timeout:opt.timeout||30000,headers:opt.headers,anonymous:opt.anonymous,onload:r=>r.status<300&&r.response?ok(r.response):no(new Error('HTTP '+r.status)),onerror:()=>no(new Error('Net')),ontimeout:()=>no(new Error('Timeout'))});});}
   function b2img(b){return new Promise((ok,no)=>{const u=URL.createObjectURL(b);const i=new Image();i.onload=()=>{URL.revokeObjectURL(u);ok(i);};i.onerror=()=>{URL.revokeObjectURL(u);no(new Error('dec'));};i.src=u;});}
 
   async function compose(blobs, scale) {
@@ -552,63 +552,192 @@
   // 在 niji 的 lightbox (单图详情) 里,官方下载按钮旁加一个 "💾+seed" 按钮
   // 下载 CDN 原始 PNG → 注入 metadata (含 seed) → 保存
 
-  function scanLightbox() {
-    // 已经注入过就跳过
-    if (document.querySelector('.nj-lb-btn')) return;
+  function uniq(arr) {
+    return [...new Set(arr.filter(Boolean))];
+  }
 
-    // 找官方下载按钮: title="Download Image"
-    const dlBtn = document.querySelector('button[title="Download Image"]');
-    if (!dlBtn) return;
+  function toAbsUrl(u) {
+    try { return new URL(u, location.href).toString(); } catch { return ''; }
+  }
 
-    // 从 URL 或图片 src 提取 jobId 和 index
-    let jobId = null, imgIndex = null;
+  function parseCdnImageRef(src) {
+    if (!src || typeof src !== 'string') return null;
+    const srcUrl = toAbsUrl(src);
+    const clean = srcUrl.split('?')[0];
+    const m = clean.match(/(https?:\/\/cdn\.(?:midjourney|nijijourney)\.com\/(?:[^/]+\/)*)([a-f0-9-]{36})\/0_(\d+)\.(?:png|webp|jpe?g)$/i);
+    if (!m) return null;
+    const imgIndex = parseInt(m[3], 10);
+    return { jobId: m[2], imgIndex, srcUrl, pngUrl: `${m[1]}${m[2]}/0_${imgIndex}.png` };
+  }
+
+  function sameCdnImageUrl(u, jobId, imgIndex) {
+    const ref = parseCdnImageRef(u);
+    return ref && ref.jobId === jobId && ref.imgIndex === imgIndex;
+  }
+
+  function officialDownloadCandidates(dlBtn, jobId, imgIndex) {
+    if (!dlBtn) return [];
+    const urls = [];
+    for (const el of [dlBtn, dlBtn.closest('a'), dlBtn.parentElement, ...dlBtn.querySelectorAll('a[href]')]) {
+      const href = el?.href || el?.getAttribute?.('href');
+      if (href) urls.push(toAbsUrl(href));
+    }
+    return urls.filter(u => sameCdnImageUrl(u, jobId, imgIndex));
+  }
+
+  function scoreLightboxImg(img) {
+    const r = img.getBoundingClientRect();
+    const visible = r.width > 20 && r.height > 20 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth;
+    let score = visible ? r.width * r.height : 0;
+    if (img.closest('.cursor-zoom-in, .cursor-zoom-out')) score += 1e9;
+    if (img.closest('[role="dialog"], #lightboxPrompt')) score += 1e8;
+    return score;
+  }
+
+  function currentLightboxContext(dlBtn = null) {
+    let jobId = null, imgIndex = null, pngUrl = '';
 
     // URL: /jobs/5f663a05-...?index=2
     const urlMatch = location.pathname.match(/\/jobs\/([a-f0-9-]{36})/i);
     if (urlMatch) jobId = urlMatch[1];
-    const idxMatch = location.search.match(/index=(\d+)/);
-    if (idxMatch) imgIndex = parseInt(idxMatch[1]);
+    const idxMatch = location.search.match(/[?&](?:index|imageIndex)=(\d+)/);
+    if (idxMatch) imgIndex = parseInt(idxMatch[1], 10);
 
-    // fallback: 从 lightbox 里的大图 src 提取
-    if (!jobId) {
-      const lbImg = document.querySelector('.cursor-zoom-in img[src*="cdn.midjourney.com"], .cursor-zoom-out img[src*="cdn.midjourney.com"]');
-      if (lbImg) {
-        const src = lbImg.src || '';
-        const m = src.match(/cdn\.midjourney\.com\/([a-f0-9-]{36})\/0_(\d+)/i);
-        if (m) { jobId = m[1]; if (imgIndex == null) imgIndex = parseInt(m[2]); }
-      }
+    // 始终从当前可见的大图 src 再解析一次。部分页面只有 /jobs/<id>，没有 ?index；
+    // SPA 切换同一 job 的第 2/3/4 张图时，旧按钮闭包也可能仍保存着 index=0。
+    const refs = [...document.querySelectorAll('img[src*="cdn.midjourney.com"], img[src*="cdn.nijijourney.com"]')]
+      .map(img => ({ img, ref: parseCdnImageRef(img.currentSrc || img.src || '') }))
+      .filter(x => x.ref && (!jobId || x.ref.jobId === jobId))
+      .sort((a, b) => scoreLightboxImg(b.img) - scoreLightboxImg(a.img));
+    let visibleSrcUrl = '';
+    if (refs.length) {
+      const best = refs[0];
+      const ref = best.ref;
+      const bestScore = scoreLightboxImg(best.img);
+      if (!jobId) jobId = ref.jobId;
+      if (imgIndex == null || bestScore >= 1e8) imgIndex = ref.imgIndex;
+      pngUrl = ref.pngUrl.replace(/0_\d+\.png$/i, `0_${imgIndex}.png`);
+      visibleSrcUrl = ref.srcUrl;
     }
 
-    if (!jobId) return;
+    if (!jobId) return null;
     if (imgIndex == null) imgIndex = 0;
+    if (!pngUrl) pngUrl = `${CDN}/${jobId}/0_${imgIndex}.png`;
+    const candidates = uniq([pngUrl, ...officialDownloadCandidates(dlBtn, jobId, imgIndex), visibleSrcUrl, `${CDN}/${jobId}/0_${imgIndex}.png`]);
+    return { jobId, imgIndex, pngUrl, candidates };
+  }
+
+  async function pageFetchBlob(url) {
+    const r = await oF(url, { method: 'GET', mode: 'cors', credentials: 'omit', referrer: location.href });
+    if (!r.ok) throw new Error('fetch HTTP ' + r.status);
+    return await r.blob();
+  }
+
+  async function gmBlobWithReferrerFallback(url) {
+    try {
+      return await pageFetchBlob(url);
+    } catch (fetchErr) {
+      try {
+        return await gmBlob(url, { headers: { Referer: location.href } });
+      } catch (withRefErr) {
+        try {
+          return await gmBlob(url);
+        } catch (plainErr) {
+          plainErr.message = `${plainErr.message}; page fetch: ${fetchErr.message}; referrer retry: ${withRefErr.message}`;
+          throw plainErr;
+        }
+      }
+    }
+  }
+
+  async function assertPngBlob(blob, url) {
+    if (!blob || !blob.size) throw new Error('empty response');
+    if (blob.type && !/png/i.test(blob.type)) throw new Error(`not PNG content-type (${blob.type})`);
+    const sig = new Uint8Array(await blob.slice(0, 8).arrayBuffer());
+    const pngSig = [137, 80, 78, 71, 13, 10, 26, 10];
+    if (sig.length < pngSig.length || pngSig.some((v, i) => sig[i] !== v)) {
+      throw new Error(`not PNG bytes (${url})`);
+    }
+  }
+
+  async function lightboxOriginalBlob(candidates) {
+    let lastErr = null;
+    for (const url of uniq(candidates)) {
+      try {
+        log(`下载原图: ${url}`);
+        const blob = await gmBlobWithReferrerFallback(url);
+        // 即使 URL 以 .png 结尾，CDN 也可能 200 返回 HTML/JSON fallback；必须验 MIME 与 PNG 魔数，
+        // 否则 embedPngText 会把非 PNG 当 PNG 处理，导致报错或生成损坏文件。
+        await assertPngBlob(blob, url);
+        return { blob, url };
+      } catch (err) {
+        lastErr = err;
+        warn(`原图候选下载失败: ${url}`, err);
+      }
+    }
+    throw lastErr || new Error('No original image candidates');
+  }
+
+  function scanLightbox() {
+    // 找官方下载按钮: title="Download Image"
+    const dlBtn = document.querySelector('button[title="Download Image"]');
+    if (!dlBtn) return;
+
+    const ctx = currentLightboxContext(dlBtn);
+    if (!ctx) return;
+
+    let btn = document.querySelector('.nj-lb-btn');
+    if (btn) {
+      btn.dataset.jobId = ctx.jobId;
+      btn.dataset.imgIndex = String(ctx.imgIndex);
+      btn.dataset.pngUrl = ctx.pngUrl;
+      btn.dataset.candidates = JSON.stringify(ctx.candidates || [ctx.pngUrl]);
+      btn.title = `下载原图 + Seed 元数据 (NijiExport) - 0_${ctx.imgIndex}.png`;
+      return;
+    }
 
     // 创建按钮
-    const btn = document.createElement('button');
+    btn = document.createElement('button');
     btn.className = 'nj-lb-btn';
-    btn.title = '下载原图 + Seed 元数据 (NijiExport)';
+    btn.title = `下载原图 + Seed 元数据 (NijiExport) - 0_${ctx.imgIndex}.png`;
+    btn.dataset.jobId = ctx.jobId;
+    btn.dataset.imgIndex = String(ctx.imgIndex);
+    btn.dataset.pngUrl = ctx.pngUrl;
+    btn.dataset.candidates = JSON.stringify(ctx.candidates || [ctx.pngUrl]);
     btn.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" stroke-width="2" stroke="currentColor" height="18" class="shrink-0"><path stroke-linecap="round" stroke-linejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg><span class="nj-lb-badge">+S</span>`;
 
     btn.addEventListener('click', async (e) => {
       e.preventDefault(); e.stopPropagation();
-      await lightboxDownload(btn, jobId, imgIndex);
+      let savedCandidates = [];
+      try { savedCandidates = JSON.parse(btn.dataset.candidates || '[]'); } catch {}
+      const latest = currentLightboxContext(dlBtn) || {
+        jobId: btn.dataset.jobId,
+        imgIndex: parseInt(btn.dataset.imgIndex || '0', 10),
+        pngUrl: btn.dataset.pngUrl,
+        candidates: savedCandidates.length ? savedCandidates : [btn.dataset.pngUrl]
+      };
+      if (!latest?.jobId) return;
+      await lightboxDownload(btn, latest.jobId, latest.imgIndex, latest.pngUrl, latest.candidates);
     });
 
     // 插入到官方下载按钮旁边
     dlBtn.parentElement.insertBefore(btn, dlBtn.nextSibling);
-    log(`lightbox 按钮已注入: ${jobId.slice(0, 8)} index=${imgIndex}`);
+    log(`lightbox 按钮已注入: ${ctx.jobId.slice(0, 8)} index=${ctx.imgIndex}`);
   }
 
-  async function lightboxDownload(btn, jobId, imgIndex) {
+  async function lightboxDownload(btn, jobId, imgIndex, pngUrl, candidates = []) {
     if (btn.dataset.busy) return;
     btn.dataset.busy = '1';
     const origHtml = btn.innerHTML;
     btn.innerHTML = '⏳';
 
     try {
-      // 1. 下载原始 PNG
-      const pngUrl = `${CDN}/${jobId}/0_${imgIndex}.png`;
-      log(`下载原图: ${pngUrl}`);
-      const pngBlob = await gmBlob(pngUrl);
+      // 1. 下载原始 PNG。优先用当前 lightbox/官方按钮解析出的候选地址，
+      // 并带 Referer 重试，避免 CDN 对无来源的 userscript 跨站请求返回 Net。
+      pngUrl = pngUrl || `${CDN}/${jobId}/0_${imgIndex}.png`;
+      const original = await lightboxOriginalBlob([pngUrl, ...candidates]);
+      pngUrl = original.url;
+      const pngBlob = original.blob;
 
       // 2. 获取 seed
       let seed = null;
