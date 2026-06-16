@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         NovelAI Vibe Batch Commit-Strict
 // @namespace    local.nai.vibe.batch.commitstrict
-// @version      1.0.13
+// @version      1.0.14
 // @description  Strict per-card vibe extraction/downloading with commit verification for long virtualized lists
 // @author       Adonais
 // @match        https://novelai.net/*
@@ -40,19 +40,23 @@
   let running = false;
   let stopRequested = false;
   let panel = null;
-  let pendingDownloadPrefix = '';
+  let pendingDownloadName = '';
 
   // -----------------------------
   // download filename prefix
   // -----------------------------
+  function sanitizeDownloadName(name) {
+    return String(name)
+      .replace(/[\\/:*?"<>|]/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
   function renameDownloadAnchor(anchor) {
-    if (!pendingDownloadPrefix || !anchor || !anchor.hasAttribute('download')) return;
+    if (!pendingDownloadName || !anchor || !anchor.hasAttribute('download')) return;
     try {
-      const oldName = anchor.getAttribute('download') || '';
-      const prefix = String(pendingDownloadPrefix).replace(/[^a-zA-Z0-9._-]/g, '');
-      if (oldName && prefix && !oldName.startsWith(prefix + '_')) {
-        anchor.setAttribute('download', `${prefix}_${oldName}`);
-      }
+      const newName = sanitizeDownloadName(pendingDownloadName);
+      if (newName) anchor.setAttribute('download', newName);
     } catch (err) {
       console.warn('[NAI CommitStrict] rename hook failed', err);
     }
@@ -983,12 +987,12 @@
       throw new Error(`卡片 ${id} 当前不是可下载状态`);
     }
 
-    pendingDownloadPrefix = `${prefix}_${id}`;
+    pendingDownloadName = `${id} ${prefix}.naiv4vibe`;
     try {
       await clickCardAction(id, list, { forDownload: true });
       await sleep(CONFIG.afterActionMs);
     } finally {
-      pendingDownloadPrefix = '';
+      pendingDownloadName = '';
     }
   }
 
